@@ -1,0 +1,171 @@
+/**
+* This file is part of ORB-SLAM2.
+*
+* Copyright (C) 2014-2016 Raúl Mur-Artal <raulmur at unizar dot es> (University of Zaragoza)
+* For more information see <https://github.com/raulmur/ORB_SLAM2>
+*
+* ORB-SLAM2 is free software: you can redistribute it and/or modify
+* it under the terms of the GNU General Public License as published by
+* the Free Software Foundation, either version 3 of the License, or
+* (at your option) any later version.
+*
+* ORB-SLAM2 is distributed in the hope that it will be useful,
+* but WITHOUT ANY WARRANTY; without even the implied warranty of
+* MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+* GNU General Public License for more details.
+*
+* You should have received a copy of the GNU General Public License
+* along with ORB-SLAM2. If not, see <http://www.gnu.org/licenses/>.
+*/
+
+
+#include<iostream>
+#include<algorithm>
+#include<fstream>
+#include<chrono>
+
+#include<opencv2/core/core.hpp>
+
+#include<System.h>
+#include "socket_protocol.h"
+
+using namespace std;
+
+socket_protocol my_socket;
+void LoadImages(const string &strFile, vector<string> &vstrImageFilenames,
+                vector<double> &vTimestamps);
+
+// ./Examples/Monocular/mono_tum   Vocabulary/ORBvoc.txt   Examples/Monocular/TUM1.yaml   Data/rgbd_dataset_freburg1_desk
+//      argv[0]：可执行文件           argv[1]：词袋路径          argv[2]：数据集格式              argv[3]：数据集路径
+//  argc = 4   表示四个参数
+int main(int argc, char **argv)
+{
+    if(argc != 4)
+    {
+        cerr << endl << "Usage: ./mono_tum path_to_vocabulary path_to_settings path_to_sequence" << endl;
+        return 1;
+    }
+    cout << "orb-slam running ..." << endl;
+    // Retrieve paths to images
+    vector<string> vstrImageFilenames;
+    vector<double> vTimestamps;
+    string strFile = string(argv[3])+"/rgb.txt";                    //rgb.txt保存每个时间戳下视频流的路径
+    cout << "load picture ..." << endl;
+    LoadImages(strFile, vstrImageFilenames, vTimestamps);           //提取时间戳和路径
+    cout << "load picture finish ..." << endl;
+    int nImages = vstrImageFilenames.size();
+
+    // Create SLAM system. It initializes all system threads and gets ready to process frames.
+    ORB_SLAM2::System SLAM(argv[1],argv[2],ORB_SLAM2::System::MONOCULAR,true);
+
+    my_socket.socket_init();      //socket初始化
+    // Vector for tracking time statistics
+    vector<float> vTimesTrack;
+    vTimesTrack.resize(nImages);
+
+    cout << endl << "-------" << endl;
+    cout << "Start processing sequence ..." << endl;
+    cout << "Images in the sequence: " << nImages << endl << endl;
+
+    // Main loop
+    cv::Mat im;
+    for(int ni=0; ni<nImages; ni++)
+    {
+        // Read image from file
+        const string path = string(argv[3])+"/"+vstrImageFilenames[ni];
+        im = cv::imread(path,CV_LOAD_IMAGE_UNCHANGED);
+        double tframe = vTimestamps[ni];
+
+        if(im.empty())
+        {
+            cerr << endl << "Failed to load image at: "
+                 << string(argv[3]) << "/" << vstrImageFilenames[ni] << endl;
+            return 1;
+        }
+        my_socket.socket_send(path);  //发送路径到yolov5
+#ifdef COMPILEDWITHC11  //适用C11编译
+        std::chrono::steady_clock::time_point t1 = std::chrono::steady_clock::now();
+#else
+        std::chrono::monotonic_clock::time_point t1 = std::chrono::monotonic_clock::now();
+#endif
+
+        // Pass the image to the SLAM system
+        SLAM.TrackMonocular(im,tframe);
+
+#ifdef COMPILEDWITHC11
+        std::chrono::steady_clock::time_point t2 = std::chrono::steady_clock::now();
+#else
+        std::chrono::monotonic_clock::time_point t2 = std::chrono::monotonic_clock::now();
+#endif
+
+        double ttrack= std::chrono::duration_cast<std::chrono::duration<double> >(t2 - t1).count();
+
+        vTimesTrack[ni]=ttrack;
+
+        // Wait to load the next frame
+        double T=0;
+        if(ni<nImages-1)
+            T = vTimestamps[ni+1]-tframe;
+        else if(ni>0)
+            T = tframe-vTimestamps[ni-1];
+
+        if(ttrack<T)
+            usleep((T-ttrack)*1e6);
+    }
+    cout << "Track over hwh" << endl;
+    // Stop all threads
+    SLAM.Shutdown();
+    cout << "Shutdown over" << endl;
+    // Tracking time statistics
+    sort(vTimesTrack.begin(),vTimesTrack.end());
+    float totaltime = 0;
+    for(int ni=0; ni<nImages; ni++)
+    {
+        totaltime+=vTimesTrack[ni];
+    }
+    cout << "-------" << endl << endl;
+    cout << "median tracking time: " << vTimesTrack[nImages/2] << endl;
+    cout << "mean tracking time: " << totaltime/nImages << endl;
+
+    // Save camera trajectory
+    SLAM.SaveKeyFrameTrajectoryTUM("KeyFrameTrajectory.txt");
+
+    return 0;
+}
+
+/**
+ * @brief 导入图片
+ * 
+ * @param[in] strFile                   读入的文件名称
+ * @param[in&out] vstrImageFilenames    彩色图片名称
+ * @param[in&out] vTimestamps           记录时间戳
+ */
+void LoadImages(const string &strFile, vector<string> &vstrImageFilenames, vector<double> &vTimestamps)
+{
+    ifstream f;
+    f.open(strFile.c_str());
+
+    // skip first three lines
+    // 前三行是注释，跳过
+    string s0;
+    getline(f,s0);
+    getline(f,s0);
+    getline(f,s0);
+
+    while(!f.eof())
+    {
+        string s;
+        getline(f,s);
+        if(!s.empty())
+        {
+            stringstream ss;
+            ss << s;
+            double t;
+            string sRGB;
+            ss >> t;
+            vTimestamps.push_back(t);
+            ss >> sRGB;         //如果字符串中有空格，就会自动以空格作为分隔符
+            vstrImageFilenames.push_back(sRGB);
+        }
+    }
+}
